@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Oscilloscope Palantir (Web)</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>Oscilloscope Palantir (Web)</h1>
+      <div class="controls-row">
+        <label class="btn">
+          <input id="file-input" type="file" multiple webkitdirectory />
+          <span>Select Folder</span>
+        </label>
+        <select id="event-select"></select>
+        <div class="spacer"></div>
+        <button id="help-btn">Help</button>
+        <button id="theme-btn">Light Mode</button>
+      </div>
+      <div class="controls-row">
+        <button id="prev-btn">Prev</button>
+        <button id="next-btn">Next</button>
+        <label>Decim: <input id="decim" type="number" min="1" max="100" step="1" value="20" /></label>
+        <button id="export-btn">Export Results</button>
+        <button id="clear-results-btn">Clear Results</button>
+        <button id="show-info-btn">Fit Info</button>
+        <div class="spacer"></div>
+      </div>
+      <div class="controls-row">
+        <button id="sg-btn">SG Filter</button>
+        <label>Chan: <select id="sg-chan"></select></label>
+        <label>Width: <input id="sg-width" type="number" min="5" max="9999" step="2" value="200" /></label>
+        <button id="sg-clear-btn">Clear Filter</button>
+        <div class="spacer"></div>
+        <button id="scan-btn">Feature Scan</button>
+        <button id="clear-filter-btn">Clear Filtered Events</button>
+      </div>
+      <div class="controls-row">
+        <label>Fit: <select id="fit-select"></select></label>
+        <button id="run-fit-btn">Run Fit</button>
+        <button id="batch-fit-btn">Batch Run</button>
+        <label>Chan: <select id="fit-chan"></select></label>
+        <label><input id="fit-invert" type="checkbox" /> Invert</label>
+        <label>Fit Res: <input id="fit-res" type="number" min="200" max="10000" step="100" value="2000" /></label>
+        <button id="adjust-btn">Adjust Fit</button>
+        <button id="clear-fit-btn">Clear Fit</button>
+      </div>
+    </header>
+
+    <main>
+      <div id="plots" class="plots"></div>
+    </main>
+
+    <aside id="fit-info" class="panel hidden">
+      <div class="panel-header">
+        <h3>Fit Information</h3>
+        <button id="fit-info-close">×</button>
+      </div>
+      <div id="fit-summary"></div>
+      <div id="fit-table"></div>
+    </aside>
+  </div>
+
+  <div id="busy" class="busy hidden">
+    <div class="busy-box">
+      <div id="busy-text">Working…</div>
+    </div>
+  </div>
+
+  <div id="adjust" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-row"><strong>Adjust Fit</strong><div class="spacer"></div><button id="adjust-close">×</button></div>
+      <div class="modal-row">
+        <label>Fit Instance: <select id="adjust-fit-select"></select></label>
+      </div>
+      <div id="adjust-params" class="form-grid"></div>
+      <div class="modal-row" style="justify-content:flex-end; gap:10px;">
+        <button id="adjust-plot">Plot</button>
+        <button id="adjust-refit">Refit</button>
+        <button id="adjust-apply">Apply</button>
+        <button id="adjust-cancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
