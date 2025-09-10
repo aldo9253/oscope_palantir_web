@@ -14,7 +14,10 @@ Status
 - Dynamic fits: QD3Fit, QDMFit, CSA_pulse, skew_gaussian, gaussian.
 - Batch Run across an event range for the selected fit/time window.
 - Feature Scan to flag events with |signal| > threshold × std.
-- Results are kept in-memory and can be exported as JSON.
+- Results are kept in-memory and can be exported as JSON; CSV fallback export is available.
+- Import Results (JSON) merges saved fits back into the session (dataset-aware).
+- low_pass_max measurement (SG+peak) with invert handling.
+- Derived metrics for QD3/QDM (charge/mass/radius) shown in Fit Info.
 
 Limitations (for now)
 ---------------------
@@ -53,5 +56,15 @@ structure with keys like `evt_<id>_<fit>_ch<ch>`.
 Planned
 -------
 - Direct `.trc` parsing in the browser (if feasible), or a lightweight local companion.
-- HDF5 export compatibility.
+- HDF5 export/import via h5wasm (scaffolded; see below to enable).
 - UI polish to fully match the desktop app.
+
+HDF5 (optional)
+---------------
+To enable HDF5 import/export in the browser, place the h5wasm bundle under:
+
+    oscope_html/vendor/h5wasm/hdf5_hl.js
+
+and the associated WASM assets as required by that build. After reloading
+`index.html`, the Export/Import HDF5 buttons will attempt to use the HDF5 engine.
+If unavailable, the app offers a CSV fallback for export and a message for import.

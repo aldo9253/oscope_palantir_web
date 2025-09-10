@@ -24,7 +24,10 @@
         <button id="prev-btn">Prev</button>
         <button id="next-btn">Next</button>
         <label>Decim: <input id="decim" type="number" min="1" max="100" step="1" value="20" /></label>
+        <button id="import-btn">Import Results</button>
         <button id="export-btn">Export Results</button>
+        <button id="export-h5-btn">Export HDF5</button>
+        <button id="import-h5-btn">Import HDF5</button>
         <button id="clear-results-btn">Clear Results</button>
         <button id="show-info-btn">Fit Info</button>
         <div class="spacer"></div>
@@ -47,6 +50,7 @@
         <label>Fit Res: <input id="fit-res" type="number" min="200" max="10000" step="100" value="2000" /></label>
         <button id="adjust-btn">Adjust Fit</button>
         <button id="clear-fit-btn">Clear Fit</button>
+        <button id="clear-chan-btn">Clear Chan</button>
       </div>
     </header>
 
@@ -58,6 +62,9 @@
       <div class="panel-header">
         <h3>Fit Information</h3>
         <button id="fit-info-close">×</button>
+      </div>
+      <div class="controls-row" style="padding: 0 10px;">
+        <label><input id="fit-info-only-ds" type="checkbox" checked /> Only current dataset</label>
       </div>
       <div id="fit-summary"></div>
       <div id="fit-table"></div>
@@ -87,5 +94,8 @@
   </div>
 
   <script src="app.js"></script>
+  <!-- hidden file inputs for imports -->
+  <input id="import-json-input" type="file" accept="application/json" style="display:none" />
+  <input id="import-h5-input" type="file" accept=".h5,.hdf5,application/x-hdf5" style="display:none" />
 </body>
 </html>

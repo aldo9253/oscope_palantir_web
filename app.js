@@ -15,7 +15,50 @@ const state = {
   featureFilter: null,  // array of filtered event keys
   scales: {},           // per-ev:ch -> {tmin,tmax,ymin,ymax}
   fitResolution: 2000,
+  datasetId: null,
 };
+
+// Compute worker wrapper to offload DSP/fits off the main thread
+const compute = (function(){
+  let w=null; let nextId=1; const pending=new Map();
+  function ensure(){
+    if(!w){
+      try { w = new Worker('worker.js'); }
+      catch (e) { console.warn('Worker init failed, using main-thread fallback', e); w=null; }
+      if(w){
+        w.onmessage = (ev)=>{
+          const {id, ok, result, error} = ev.data||{};
+          const p = pending.get(id); if(!p) return; pending.delete(id);
+          if(ok) p.resolve(result); else p.reject(new Error(error||'Worker error'));
+        };
+      }
+    }
+    return w;
+  }
+  function call(type, payload){
+    if(!ensure()){
+      // Fallback path executes synchronously on main thread
+      return new Promise((resolve, reject)=>{
+        try{
+          if(type==='sg'){
+            const {y, window, poly} = payload; resolve({y: savgol(y, window, poly||2)});
+          } else if(type==='fit'){
+            const {fitName, t, y, p0} = payload; const model = FIT_LIB[fitName]; if(!model||!model.func) throw new Error('No model'); resolve({params: lsqFit(model, t, y, p0)});
+          } else if(type==='low_pass_max'){
+            const {t, y, width, invert} = payload; const wOdd = (width%2===0)? width+1: width; const yproc = invert? y.map(v=>-v): y.slice(); const ys = savgol(yproc, wOdd, 2); const idx=argMax(ys); const t_at=t[Math.max(0, Math.min(idx, t.length-1))]; const val = invert? -ys[idx]: ys[idx]; resolve({value: val, t_at, width: wOdd});
+          } else { reject(new Error('Unknown compute call: '+type)); }
+        } catch (e){ reject(e); }
+      });
+    }
+    const id = nextId++;
+    return new Promise((resolve, reject)=>{ pending.set(id, {resolve, reject}); try{ w.postMessage({id, type, ...payload}); } catch(e){ pending.delete(id); reject(e);} });
+  }
+  return {
+    fit: (fitName, t, y, p0)=> call('fit', {fitName, t, y, p0}),
+    sg:  (y, width, poly=2)=> call('sg', {y, window: width, poly}),
+    lowPassMax: (t, y, width, invert)=> call('low_pass_max', {t, y, width, invert}),
+  };
+})();
 
 // Utilities
 function byId(id){ return document.getElementById(id); }
@@ -179,12 +222,18 @@ function plotWaveforms(){
     g.clearRect(0,0,w,h); g.fillStyle=colors.bg; g.fillRect(0,0,w,h);
     const data = obj.channels[ch]; const t=data.t, y=data.y; if(!t||t.length===0) continue;
     let tmin=t[0], tmax=t[t.length-1]; let ymin=Infinity, ymax=-Infinity; for(const v of y){ if(v<ymin) ymin=v; if(v>ymax) ymax=v; }
-    // include fit overlays in y-range so they are visible even if outside waveform range
+    // include fit overlays/markers in y-range so they are visible
     for(const [k,rec] of Object.entries(state.results)){
       const m = k.match(new RegExp(`^evt_${ev}_([^_]+)_ch${ch}(?:_\\d+)?$`));
-      if(!m) continue; const fitName=m[1]; const model=FIT_LIB[fitName]; if(!model) continue;
+      if(!m) continue; const fitName=m[1]; const model=FIT_LIB[fitName];
       const region = rec.fit_region || [t[0], t[t.length-1]]; const t0r=Math.max(region[0], t[0]); const t1r=Math.min(region[1], t[t.length-1]);
-      if(!(t1r>t0r)) continue; const N= Math.min(300, Math.max(50, Math.floor((t1r-t0r)/(t[1]-t[0]) / (state.decim||1))));
+      if(!(t1r>t0r)) continue;
+      if(fitName==='low_pass_max'){
+        if(Number.isFinite(rec.value)) { if(rec.value<ymin) ymin=rec.value; if(rec.value>ymax) ymax=rec.value; }
+        continue;
+      }
+      if(!model || !model.func) continue;
+      const N= Math.min(300, Math.max(50, Math.floor((t1r-t0r)/(t[1]-t[0]) / (state.decim||1))));
       const ts = linspace(t0r, t1r, N);
       let yf; try{ yf = model.func(ts, ...rec.params); } catch(e){ yf=null; }
       if(!yf) continue; if(rec.inverted) yf = yf.map(v=>-v);
@@ -204,11 +253,20 @@ function plotWaveforms(){
     // Region overlay
     const reg = state.fitRegion[`${ev}:ch${ch}`];
     if(reg && reg.length===2){ g.strokeStyle='#ff5050'; g.setLineDash([5,4]); g.beginPath(); g.moveTo(tx(reg[0]), pad); g.lineTo(tx(reg[0]), h-pad); g.moveTo(tx(reg[1]), pad); g.lineTo(tx(reg[1]), h-pad); g.stroke(); g.setLineDash([]); }
-    // Fit overlays for this event+channel
+    // Fit overlays/markers for this event+channel
     for(const [k,rec] of Object.entries(state.results)){
       const m = k.match(new RegExp(`^evt_${ev}_([^_]+)_ch${ch}(?:_\\d+)?$`));
-      if(!m) continue; const fitName = m[1]; const model = FIT_LIB[fitName]; if(!model) continue;
-      const region = rec.fit_region || [t[0], t[t.length-1]]; const invert=!!rec.inverted;
+      if(!m) continue; const fitName = m[1]; const model = FIT_LIB[fitName]; const invert=!!rec.inverted;
+      const region = rec.fit_region || [t[0], t[t.length-1]];
+      if(fitName==='low_pass_max'){
+        if(Number.isFinite(rec.t_at) && Number.isFinite(rec.value)){
+          const X=tx(rec.t_at); const Y=ty(rec.value); const colors=getPlotColors();
+          const color = '#2ca02c';
+          g.fillStyle = color; g.beginPath(); g.arc(X, Y, 4, 0, Math.PI*2); g.fill();
+        }
+        continue;
+      }
+      if(!model || !model.func) continue;
       // Draw on a dense time grid within the region, independent of waveform sample indices
       const a = Math.max(region[0], t[0]); const b = Math.min(region[1], t[t.length-1]);
       if(!(b>a)) continue;
@@ -409,6 +467,10 @@ const FIT_LIB = {
       return out;
     }
   },
+  // Measurement (no curve): SG low-pass then take max (invert => min)
+  low_pass_max: {
+    names: ['width'],
+  },
 };
 
 // erf implementation
@@ -418,6 +480,34 @@ function erf(x){
   const a1=0.254829592,a2=-0.284496736,a3=1.421413741,a4=-1.453152027,a5=1.061405429,p=0.3275911;
   const t=1/(1+p*x); const y=1-((((a5*t+a4)*t+a3)*t+a2)*t+a1)*t*Math.exp(-x*x);
   return sign*y;
+}
+
+// Derived metrics for QD3/QDM
+function qd3Cal(q, v, rho=7500){
+  const c = 1e-12 / 20 * 0.95;
+  const charge = c * q;
+  const mass = Math.abs(2 * 2.2e6 * charge / (v*v));
+  const radius = Math.pow((3.0 * mass) / (4.0 * Math.PI * rho), 1/3);
+  return {charge, mass, radius};
+}
+function qdmCal(q, v, rho=7500){
+  const c = 1e-12 / 20 * 0.95 * 2.35;
+  const charge = c * q;
+  const mass = Math.abs(2 * 2.2e6 * charge / (v*v));
+  const radius = Math.pow((3.0 * mass) / (4.0 * Math.PI * rho), 1/3);
+  return {charge, mass, radius};
+}
+function attachDerivedMetrics(fitName, rec){
+  try{
+    if(!rec || !Array.isArray(rec.params)) return;
+    if(fitName==='QD3Fit'){
+      const t0=rec.params[0], q=rec.params[1], v=rec.params[2];
+      if(Number.isFinite(q) && Number.isFinite(v) && v!==0){ Object.assign(rec, qd3Cal(q, v)); }
+    } else if(fitName==='QDMFit'){
+      const t0=rec.params[0], q=rec.params[1], v=rec.params[2];
+      if(Number.isFinite(q) && Number.isFinite(v) && v!==0){ Object.assign(rec, qdmCal(q, v)); }
+    }
+  } catch(_){}
 }
 
 // Simple Nelder-Mead for least squares
@@ -565,6 +655,10 @@ function guessParams(fitName, names, t, y){
     const i=argMax(y);
     g.A=area; g.xi=t[i]; g.omega=(t[t.length-1]-t[0])/6; g.alpha=0; g.C=mean(y);
   }
+  if(fitName==='low_pass_max'){
+    const w = parseInt(byId('sg-width').value, 10) || 200;
+    return [w % 2 === 0 ? w+1 : w];
+  }
   return names.map(n => (n in g)? g[n]: 0);
 }
 
@@ -572,6 +666,8 @@ function guessParams(fitName, names, t, y){
 byId('file-input').addEventListener('change', async (e)=>{
   state.files = Array.from(e.target.files||[]).filter(f=>/\.(csv|txt|trc)$/i.test(f.name));
   state.eventsIndex = {}; state.events={}; state.eventOrder=[]; state.currentEvent=null; state.results={}; state.sgFiltered={}; state.featureFilter=null;
+  // derive dataset id from filenames for scoping
+  state.datasetId = computeDatasetId(state.files.map(f=> f.webkitRelativePath || f.name).sort());
   // Index only (do not parse now)
   for(const file of state.files){
     const meta = parseFileName(file.name);
@@ -591,6 +687,18 @@ byId('file-input').addEventListener('change', async (e)=>{
 function showBusy(text){ const el=byId('busy'); const t=byId('busy-text'); if(t) t.textContent = text || 'Working…'; if(el) el.classList.remove('hidden'); }
 function updateBusy(text){ const t=byId('busy-text'); if(t) t.textContent = text; }
 function hideBusy(){ const el=byId('busy'); if(el) el.classList.add('hidden'); }
+
+function computeDatasetId(names){
+  // FNV-1a 32-bit hash of concatenated names
+  let h = 0x811c9dc5;
+  for(const name of names){
+    for(let i=0;i<name.length;i++){
+      h ^= name.charCodeAt(i);
+      h = (h + ((h<<1) + (h<<4) + (h<<7) + (h<<8) + (h<<24))) >>> 0;
+    }
+  }
+  return 'ds_' + h.toString(16).padStart(8,'0');
+}
 
 async function loadEvent(ev){
   if(!ev || !state.eventsIndex[ev]) return;
@@ -652,7 +760,14 @@ byId('sg-btn').addEventListener('click', async ()=>{
   const ev=state.currentEvent; if(!ev) return; const ch=parseInt(byId('sg-chan').value,10);
   const data = await getEventChannelData(ev, ch); if(!data) return; const {t,y}=data;
   const w=parseInt(byId('sg-width').value,10)||200;
-  const yy=savgol(y, w, 2); state.sgFiltered[`${ev}:ch${ch}`]={t:[...t],y:yy};
+  showBusy('Filtering…');
+  try{
+    const res = await compute.sg(y, w, 2);
+    const yy = res && res.y ? res.y : savgol(y, w, 2);
+    state.sgFiltered[`${ev}:ch${ch}`]={t:[...t],y:yy};
+  } finally {
+    hideBusy();
+  }
   plotWaveforms();
 });
 byId('sg-clear-btn').addEventListener('click', ()=>{ const ev=state.currentEvent; if(!ev) return; const ch=parseInt(byId('sg-chan').value,10); delete state.sgFiltered[`${ev}:ch${ch}`]; plotWaveforms(); });
@@ -661,20 +776,29 @@ byId('sg-clear-btn').addEventListener('click', ()=>{ const ev=state.currentEvent
 byId('run-fit-btn').addEventListener('click', async ()=>{
   const ev=state.currentEvent; if(!ev) return; const fname=byId('fit-select').value; const model=FIT_LIB[fname];
   const ch=parseInt(byId('fit-chan').value,10); const invert=byId('fit-invert').checked;
-  const dta = await getEventChannelData(ev, ch); if(!dta) return; let {t,y}=dta; if(invert) y = y.map(v=>-v);
+  const dta = await getEventChannelData(ev, ch); if(!dta) return; let {t,y}=dta; if(fname!=='low_pass_max' && invert) y = y.map(v=>-v);
   // selection window: use saved region if present
   const reg = state.fitRegion[`${ev}:ch${ch}`];
   if(reg && reg.length===2){ const mask=t.map((tt,i)=> tt>=reg[0] && tt<=reg[1]? i: -1).filter(i=>i>=0); if(mask.length>5){ t=mask.map(i=>t[i]); y=mask.map(i=>y[i]); } }
   // subsample for fitting speed
   const ss = subsample(t, y, state.fitResolution||2000); const tf=ss.t, yf=ss.y;
-  const p0 = guessParams(fname, model.names, t, y);
-  let popt = p0;
-  showBusy('Fitting…');
-  try { popt = lsqFit(model, tf, yf, p0); }
-  catch (e) { console.error('Fit failed', e); alert('Fit failed: '+e.message); hideBusy(); return; }
   const keyBase = `evt_${ev}_${fname}_ch${ch}`; let idx=1; let key=keyBase; while(state.results[key]){ idx+=1; key=`${keyBase}_${idx}`; }
   const fitRegion = (reg && reg.length===2)? [reg[0], reg[1]]: [t[0], t[t.length-1]];
-  state.results[key] = { params: popt, param_names: model.names, fit_region: fitRegion, inverted: invert };
+  showBusy('Fitting…');
+  try{
+    if(fname==='low_pass_max'){
+      const width = (guessParams(fname, (model && model.names)||['width'], t, y)[0])|0;
+      const res = await compute.lowPassMax(tf, yf, width, invert);
+      state.results[key] = { params: [res.width], param_names: ['width'], fit_region: fitRegion, inverted: invert, value: res.value, t_at: res.t_at, dataset_id: state.datasetId };
+    } else {
+      const p0 = guessParams(fname, model.names, t, y);
+      const res = await compute.fit(fname, tf, yf, p0);
+      const popt = res && res.params ? res.params : lsqFit(model, tf, yf, p0);
+      const rec = { params: popt, param_names: model.names, fit_region: fitRegion, inverted: invert, dataset_id: state.datasetId };
+      attachDerivedMetrics(fname, rec);
+      state.results[key] = rec;
+    }
+  } catch(e){ console.error('Fit failed', e); alert('Fit failed: '+e.message); hideBusy(); return; }
   // replot; overlay handled in plotWaveforms
   plotWaveforms();
   hideBusy();
@@ -714,6 +838,7 @@ function openAdjustDialog(ev, ch, fitName, keys){
     const region = rec.fit_region; if(region && region.length===2){ const mask=t.map((tt,i)=> tt>=region[0] && tt<=region[1]? i: -1).filter(i=>i>=0); if(mask.length>5){ t=mask.map(i=>t[i]); y=mask.map(i=>y[i]); } }
     const ss=subsample(t,y,state.fitResolution||2000); const p0=readParams(); const popt=lsqFit(model, ss.t, ss.y, p0);
     rec.params=[...popt]; // update
+    attachDerivedMetrics(fitName, rec);
     buildFormForKey(key); // refresh inputs to reflect refit
     plotWaveforms();
   }
@@ -725,8 +850,8 @@ function openAdjustDialog(ev, ch, fitName, keys){
   byId('adjust-cancel').onclick = ()=>{ cancelAdjust(); };
   byId('adjust-plot').onclick = ()=>{ plotPreview(); };
   byId('adjust-refit').onclick = async ()=>{ showBusy('Refitting…'); try{ await doRefit(); } finally { hideBusy(); } };
-  byId('adjust-apply').onclick = ()=>{ // persist current form values
-    const key=sel.value; const rec=state.results[key]; rec.params = readParams(); modal.classList.add('hidden'); plotWaveforms(); cleanup(); };
+  byId('adjust-apply').onclick = ()=>{ // persist current form values and recompute derived fields
+    const key=sel.value; const rec=state.results[key]; rec.params = readParams(); attachDerivedMetrics(fitName, rec); modal.classList.add('hidden'); plotWaveforms(); cleanup(); };
   function cancelAdjust(){ // restore snapshot
     snapshot.forEach((v,k)=>{ if(state.results[k]) state.results[k].params = [...v.params]; });
     modal.classList.add('hidden'); plotWaveforms(); cleanup();
@@ -749,9 +874,24 @@ byId('batch-fit-btn').addEventListener('click', async ()=>{
   for(const ev of keys){ const data = await getEventChannelData(ev, ch); if(!data) continue; let {t,y}=data; let t0w=t0, t1w=t1; // prefer per-channel saved region
     const reg = state.fitRegion[`${ev}:ch${ch}`]; if(reg && reg.length===2){ t0w = reg[0]; t1w = reg[1]; }
     if(isFinite(t0w) && isFinite(t1w)){ const mask=t.map((tt,i)=> tt>=t0w && tt<=t1w? i: -1).filter(i=>i>=0); if(mask.length>5){ t=mask.map(i=>t[i]); y=mask.map(i=>y[i]); } }
-    if(invert) y=y.map(v=>-v);
-    const ss=subsample(t,y,state.fitResolution||2000); const p0=guessParams(fname, model.names, ss.t, ss.y);
-    try{ const popt=lsqFit(model,ss.t,ss.y,p0); const base=`evt_${ev}_${fname}_ch${ch}`; let i=1; let k=base; while(state.results[k]){ i++; k=`${base}_${i}`; } state.results[k]={params:popt,param_names:model.names,fit_region:[t[0],t[t.length-1]],inverted:invert}; added.push(k);}catch(e){/*skip*/}
+    const ss=subsample(t,y,state.fitResolution||2000);
+    try{
+      const base=`evt_${ev}_${fname}_ch${ch}`; let i=1; let k=base; while(state.results[k]){ i++; k=`${base}_${i}`; }
+      if(fname==='low_pass_max'){
+        const width = (guessParams(fname, (model && model.names)||['width'], t, y)[0])|0;
+        const res = await compute.lowPassMax(ss.t, ss.y, width, invert);
+        state.results[k]={ params:[res.width], param_names:['width'], fit_region:[t[0],t[t.length-1]], inverted: invert, value: res.value, t_at: res.t_at, dataset_id: state.datasetId };
+      } else {
+        const yy = invert? ss.y.map(v=>-v): ss.y;
+        const p0=guessParams(fname, model.names, ss.t, yy);
+        const fres = await compute.fit(fname, ss.t, yy, p0);
+        const popt = fres && fres.params ? fres.params : lsqFit(model, ss.t, yy, p0);
+        const rec = {params:popt,param_names:model.names,fit_region:[t[0],t[t.length-1]],inverted:invert, dataset_id: state.datasetId};
+        attachDerivedMetrics(fname, rec);
+        state.results[k]=rec;
+      }
+      added.push(k);
+    }catch(e){/*skip*/}
     // free memory for non-current events
     if(ev!==state.currentEvent){ delete state.events[ev]; }
     updateBusy(`Batch fitting… ${added.length}/${keys.length}`);
@@ -783,21 +923,231 @@ byId('export-btn').addEventListener('click', ()=>{
 });
 byId('clear-results-btn').addEventListener('click', ()=>{ if(confirm('Clear all results?')){ state.results={}; alert('Cleared.'); }});
 
+// Import results (JSON)
+byId('import-btn').addEventListener('click', ()=>{ byId('import-json-input').click(); });
+byId('import-json-input').addEventListener('change', async (e)=>{
+  const f = e.target.files && e.target.files[0]; if(!f) return;
+  try{
+    const text = await f.text();
+    const obj = JSON.parse(text);
+    if(typeof obj !== 'object' || Array.isArray(obj)) throw new Error('Invalid JSON structure');
+    const onlyDs = true; // default to safe merge with dataset guard
+    let added=0, skipped=0, renamed=0;
+    for(const [key, rec] of Object.entries(obj)){
+      if(!/^evt_/.test(key) || typeof rec!=='object'){ skipped++; continue; }
+      // dataset guard: allow import if dataset_id matches or absent; else allow but keep dataset_id
+      const dsOk = (!rec.dataset_id) || (rec.dataset_id===state.datasetId);
+      if(!dsOk){ /* keep but count */ }
+      let newKey = key;
+      if(state.results[newKey]){ let i=1; const base=newKey; while(state.results[newKey]){ i++; newKey = base+`_${i}`; } if(newKey!==key) renamed++; }
+      state.results[newKey] = rec;
+      added++;
+    }
+    alert(`Imported ${added} result(s). ${renamed? `Renamed ${renamed} duplicate key(s). `:''}${skipped? `Skipped ${skipped} invalid entr${skipped>1?'ies':'y'}.`:''}`);
+    plotWaveforms();
+  } catch (err){ alert('Import failed: '+String(err&&err.message||err)); }
+  e.target.value='';
+});
+
+// HDF5 export/import (requires h5wasm vendor bundle). Falls back to CSV if unavailable on export.
+async function ensureH5Wasm(){
+  if(window.h5wasmReady) return true;
+  // Prefer ESM build if available
+  const esmPaths = [
+    './vendor/h5wasm/dist/esm/hdf5_hl.js',
+    'vendor/h5wasm/dist/esm/hdf5_hl.js'
+  ];
+  for(const p of esmPaths){
+    try{
+      const mod = await import(p);
+      if(mod && mod.ready){ await mod.ready; window.h5wasmMod = mod; window.h5wasmReady = true; return true; }
+    }catch(e){ /* try next */ }
+  }
+  // Fallback to classic script loader for alternative builds
+  const scripts = [
+    'vendor/h5wasm/hdf5_hl.js',
+    'vendor/h5wasm/h5wasm.js',
+    'vendor/h5wasm/hdf5_wasm.js'
+  ];
+  for(const src of scripts){
+    try{
+      await new Promise((res, rej)=>{ const s=document.createElement('script'); s.src=src; s.onload=()=>res(); s.onerror=()=>rej(new Error('load failed')); document.head.appendChild(s); });
+      window.h5wasmMod = window.h5wasm || window.h5wasmDefault || null; // best-effort
+      window.h5wasmReady = !!window.h5wasmMod;
+      return window.h5wasmReady;
+    } catch(e){ /* try next */ }
+  }
+  return false;
+}
+
+function rowsToColumns(rows){
+  if(rows.length===0) return {};
+  const cols = Array.from(rows.reduce((s,r)=>{ Object.keys(r).forEach(k=>s.add(k)); return s; }, new Set()));
+  const out={}; cols.forEach(c=> out[c] = rows.map(r=> r[c] ?? null));
+  return out;
+}
+
+function columnsToRows(cols){
+  const keys = Object.keys(cols||{});
+  if(keys.length===0) return [];
+  const n = Math.max(...keys.map(k=> (cols[k]||[]).length));
+  const rows = new Array(n).fill(null).map(()=>({}));
+  for(const k of keys){ const arr = cols[k]||[]; for(let i=0;i<n;i++){ const v = arr[i]; if(v!=null) rows[i][k]=v; } }
+  return rows;
+}
+
+async function exportHDF5(){
+  const ok = await ensureH5Wasm(); if(!ok) throw new Error('h5wasm not available');
+  const mod = window.h5wasmMod; const File = mod.File || (mod.h5wasm && mod.h5wasm.File);
+  const Module = mod.Module || (mod.h5wasm && mod.h5wasm.Module);
+  const FS = mod.FS || (mod.h5wasm && mod.h5wasm.FS) || (Module && Module.FS);
+  if(!File || !Module || !FS) throw new Error('h5wasm API not found');
+  const rows = buildResultsRows(); if(rows.length===0) throw new Error('No fits to export');
+  const filename = `/fit_results_${Date.now()}.h5`;
+  const f = new File(filename, 'w');
+  try{
+    const root = f; const grp = root.create_group('results');
+    const cols = rowsToColumns(rows);
+    for(const [name, data] of Object.entries(cols)){
+      // Normalize types: numbers/strings; booleans to 0/1 for consistency
+      const arr = data.map(v=> typeof v==='boolean'? (v?1:0): v);
+      grp.create_dataset({ name, data: arr });
+    }
+    f.flush();
+  } finally {
+    f.close();
+  }
+  const bytes = FS.readFile(filename);
+  const blob = new Blob([bytes], {type:'application/x-hdf5'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='fit_results.h5'; a.click(); URL.revokeObjectURL(a.href);
+}
+
+function mergeRowsIntoResults(rows){
+  let added=0, renamed=0;
+  for(const row of rows){
+    const event = row.event; const ch = row.channel; const fit = row.fit_type; if(event==null || ch==null || !fit) continue;
+    const fitName = String(fit);
+    const paramNames = (FIT_LIB[fitName] && FIT_LIB[fitName].names) ? FIT_LIB[fitName].names : Object.keys(row).filter(k=> !['event','channel','fit_type','inverted','dataset_id','value','t_at','charge','mass','radius'].includes(k));
+    const params = paramNames.map(n=> row[n] ?? 0);
+    const keyBase = `evt_${event}_${fitName}_ch${ch}`; let key=keyBase; let i=1; while(state.results[key]){ i++; key = `${keyBase}_${i}`; }
+    if(key!==keyBase) renamed++;
+    const rec = { params, param_names: paramNames, fit_region: null, inverted: !!row.inverted, dataset_id: row.dataset_id || state.datasetId };
+    if(row.value!=null) rec.value = row.value; if(row.t_at!=null) rec.t_at=row.t_at; if(row.charge!=null) rec.charge=row.charge; if(row.mass!=null) rec.mass=row.mass; if(row.radius!=null) rec.radius=row.radius;
+    // Compute derived metrics if missing
+    attachDerivedMetrics(fitName, rec);
+    state.results[key] = rec; added++;
+  }
+  return {added, renamed};
+}
+
+async function importHDF5File(file){
+  const ok = await ensureH5Wasm(); if(!ok) throw new Error('h5wasm not available');
+  const mod = window.h5wasmMod; const File = mod.File || (mod.h5wasm && mod.h5wasm.File);
+  const Module = mod.Module || (mod.h5wasm && mod.h5wasm.Module);
+  const FS = mod.FS || (mod.h5wasm && mod.h5wasm.FS) || (Module && Module.FS);
+  if(!File || !Module || !FS) throw new Error('h5wasm API not found');
+  const path = `/import_${Date.now()}.h5`;
+  const buf = new Uint8Array(await file.arrayBuffer());
+  FS.writeFile(path, buf);
+  let f=null;
+  try{
+    f = new File(path, 'r');
+    const root = f; const grp = root.get('/results'); if(!grp) throw new Error('results group not found');
+    const names = grp.keys(); const cols = {};
+    for(const name of names){
+      const ds = grp.get(name); if(!ds || ds.type!=='Dataset') continue;
+      const val = ds.value; // typed array or list
+      cols[name] = Array.isArray(val) ? val : Array.from(val||[]);
+    }
+    const rows = columnsToRows(cols);
+    const {added, renamed} = mergeRowsIntoResults(rows);
+    alert(`Imported ${added} row(s) from HDF5.${renamed? ` Renamed ${renamed} duplicate key(s).`:''}`);
+    plotWaveforms();
+  } finally {
+    if(f) f.close();
+  }
+}
+
+function buildResultsRows(){
+  const rows=[];
+  const re = /^evt_(\w+)_([^_]+)_ch(\d+)(?:_\d+)?$/;
+  for(const [k,rec] of Object.entries(state.results)){
+    const m = k.match(re); if(!m) continue;
+    const [_, event, fit, ch] = m;
+    const row = { event, channel: parseInt(ch,10), fit_type: fit, inverted: !!rec.inverted, dataset_id: rec.dataset_id||state.datasetId||'' };
+    if(Array.isArray(rec.param_names) && Array.isArray(rec.params)){
+      for(let i=0;i<rec.param_names.length;i++) row[rec.param_names[i]] = rec.params[i];
+    }
+    if(rec.value!=null) row.value = rec.value;
+    if(rec.t_at!=null) row.t_at = rec.t_at;
+    if(rec.charge!=null) row.charge = rec.charge;
+    if(rec.mass!=null) row.mass = rec.mass;
+    if(rec.radius!=null) row.radius = rec.radius;
+    rows.push(row);
+  }
+  return rows;
+}
+
+function downloadCSVFromRows(rows, filename){
+  if(rows.length===0){ alert('No fits to export.'); return; }
+  const cols = Array.from(rows.reduce((s,r)=>{ Object.keys(r).forEach(k=>s.add(k)); return s; }, new Set()));
+  const header = cols.join(',');
+  const lines = rows.map(r=> cols.map(c=>{
+    const v = r[c]; if(v==null) return '';
+    if(typeof v==='number') return String(v);
+    const t = String(v).replace(/"/g,'""'); return '"'+t+'"';
+  }).join(','));
+  const csv = [header, ...lines].join('\n');
+  const blob = new Blob([csv], {type:'text/csv'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=filename; a.click(); URL.revokeObjectURL(a.href);
+}
+
+byId('export-h5-btn').addEventListener('click', async ()=>{
+  try{
+    await exportHDF5();
+  } catch(e){
+    console.warn('HDF5 export failed', e);
+    if(confirm('HDF5 export failed. Download CSV fallback instead?')){
+      const rows = buildResultsRows(); downloadCSVFromRows(rows, 'fit_results.csv');
+    } else {
+      alert('Ensure h5wasm ESM bundle is served and try again.');
+    }
+  }
+});
+
+byId('import-h5-btn').addEventListener('click', async ()=>{ byId('import-h5-input').click(); });
+
+byId('import-h5-input').addEventListener('change', async (e)=>{
+  const f = e.target.files && e.target.files[0]; if(!f) return;
+  try { await importHDF5File(f); } catch (err){ alert('HDF5 import failed: '+String(err&&err.message||err)); }
+  e.target.value='';
+});
+
 // Fit info panel (simple)
 byId('show-info-btn').addEventListener('click', ()=>{
   const panel=byId('fit-info'); panel.classList.remove('hidden');
   const table=byId('fit-table'); const summary=byId('fit-summary');
   const rows=[]; const evt=state.currentEvent;
+  const onlyDs = byId('fit-info-only-ds').checked;
+  const curDs = state.datasetId;
   for(const [k,rec] of Object.entries(state.results)){
     const m = k.match(/^evt_(\w+)_([^_]+)_ch(\d+)/);
     if(!m) continue; const event=m[1], fit=m[2], ch=m[3];
+    if(onlyDs && curDs && rec.dataset_id && rec.dataset_id !== curDs) continue;
     const params = rec.params.map(v=>Number(v).toExponential(3)).join(', ');
-    rows.push(`<tr><td>${event}</td><td>${ch}</td><td>${fit}</td><td>${params}</td></tr>`);
+    const inv = rec.inverted? 'Y':'N';
+    const val = (rec.value!=null && isFinite(rec.value))? Number(rec.value).toExponential(3): '';
+    const tat = (rec.t_at!=null && isFinite(rec.t_at))? Number(rec.t_at).toExponential(3): '';
+    const q = (rec.charge!=null && isFinite(rec.charge))? Number(rec.charge).toExponential(3): '';
+    const mkg = (rec.mass!=null && isFinite(rec.mass))? Number(rec.mass).toExponential(3): '';
+    const r = (rec.radius!=null && isFinite(rec.radius))? Number(rec.radius).toExponential(3): '';
+    rows.push(`<tr><td>${event}</td><td>${ch}</td><td>${fit}</td><td>${inv}</td><td>${val}</td><td>${tat}</td><td>${q}</td><td>${mkg}</td><td>${r}</td><td>${params}</td></tr>`);
   }
-  table.innerHTML = `<table><thead><tr><th>Event</th><th>Ch</th><th>Fit</th><th>Params</th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
+  table.innerHTML = `<table><thead><tr><th>Event</th><th>Ch</th><th>Fit</th><th>Inv</th><th>Value</th><th>t_at</th><th>Charge</th><th>Mass</th><th>Radius</th><th>Params</th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
   summary.textContent = evt? `Current: ${evt}`: '';
 });
 byId('fit-info-close').addEventListener('click', ()=> byId('fit-info').classList.add('hidden'));
+byId('fit-info-only-ds').addEventListener('change', ()=>{ if(!byId('fit-info').classList.contains('hidden')) byId('show-info-btn').click(); });
 
 // Theme toggle
 byId('theme-btn').addEventListener('click', ()=>{
@@ -820,4 +1170,35 @@ byId('theme-btn').addEventListener('click', ()=>{
 // Help
 byId('help-btn').addEventListener('click', ()=>{
   alert('Load CSV data (C<ch>-<event>.csv). Use SG filter, run fits, batch, and feature scan. Results export as JSON.');
+});
+
+// Keyboard shortcuts
+document.addEventListener('keydown', (e)=>{
+  if(e.target && (e.target.tagName==='INPUT' || e.target.tagName==='SELECT' || e.target.isContentEditable)) return;
+  const k = e.key.toLowerCase();
+  const fitSelEl = byId('fit-select');
+  const setFit = (name)=>{ const opt = Array.from(fitSelEl.options).find(o=>o.value.toLowerCase()===name.toLowerCase()); if(opt){ fitSelEl.value=opt.value; e.preventDefault(); }};
+  if(k==='q') setFit('QD3Fit');
+  else if(k==='d') setFit('QDMFit');
+  else if(k==='c') setFit('CSA_pulse');
+  else if(k==='w') setFit('skew_gaussian');
+  else if(k==='g') setFit('gaussian');
+  else if(k==='x') setFit('low_pass_max');
+  else if(k==='i'){ const cb=byId('fit-invert'); cb.checked=!cb.checked; e.preventDefault(); }
+  else if(k==='s'){ byId('sg-btn').click(); e.preventDefault(); }
+  else if(k==='a'){ byId('adjust-btn').click(); e.preventDefault(); }
+  else if(k==='r'){ byId('clear-fit-btn').click(); e.preventDefault(); }
+  else if(k===',' ){ byId('prev-btn').click(); e.preventDefault(); }
+  else if(k==='.') { byId('next-btn').click(); e.preventDefault(); }
+});
+
+// Clear all fits for current event/channel
+byId('clear-chan-btn').addEventListener('click', ()=>{
+  const ev=state.currentEvent; if(!ev) return; const ch=parseInt(byId('fit-chan').value,10);
+  let removed=0; const re = new RegExp(`^evt_${ev}_.+_ch${ch}(?:_\\d+)?$`);
+  for(const k of Object.keys(state.results)){
+    if(re.test(k)){ delete state.results[k]; removed++; }
+  }
+  alert(`Removed ${removed} fit(s) for ch${ch}.`);
+  plotWaveforms();
 });
