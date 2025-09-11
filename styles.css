@@ -12,8 +12,8 @@ header { padding: 8px 12px; border-bottom: 1px solid #444; }
 button, select, input[type="number"] { background: var(--btn-bg, #333); color: var(--fg); border: 1px solid var(--accent); padding: 4px 8px; border-radius: 4px; }
 label.btn { border: 1px solid var(--accent); padding: 4px 8px; border-radius: 4px; background: #333; cursor: pointer; }
 label.btn input[type=file] { display: none; }
-main { flex: 1; display: flex; align-items: flex-start; justify-content: center; overflow: auto; padding: 8px; }
-.plots { width: 100%; max-width: 1400px; display: flex; flex-direction: column; gap: 4px; }
+main { flex: 1; display: flex; align-items: stretch; justify-content: flex-start; overflow: auto; padding: 8px; }
+.plots { width: 100%; max-width: none; display: flex; flex-direction: column; gap: 4px; }
 .plot-item { background: var(--panel); border: 1px solid var(--accent); padding: 4px; border-radius: 6px; }
 .plot-header { display: flex; align-items: center; gap: 6px; color: var(--fg); margin-bottom: 2px; }
 .plot-canvas { width: 100%; background: transparent; border: 1px solid #333; }
