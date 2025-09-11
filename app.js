@@ -956,7 +956,8 @@ async function ensureH5Wasm(){
   const esmPaths = [
     './hdf5_hl.js', // user-provided copy alongside index.html
     './vendor/h5wasm/dist/esm/hdf5_hl.js',
-    'vendor/h5wasm/dist/esm/hdf5_hl.js'
+    'vendor/h5wasm/dist/esm/hdf5_hl.js',
+    'https://unpkg.com/@h5web/h5wasm@latest/dist/esm/hdf5_hl.js'
   ];
   for(const p of esmPaths){
     try{

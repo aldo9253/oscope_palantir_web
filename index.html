@@ -93,9 +93,9 @@
     </div>
   </div>
 
-  <script src="app.js"></script>
-  <!-- hidden file inputs for imports -->
+  <!-- hidden file inputs for imports (placed before app.js so handlers can attach) -->
   <input id="import-json-input" type="file" accept="application/json" style="display:none" />
   <input id="import-h5-input" type="file" accept=".h5,.hdf5,application/x-hdf5" style="display:none" />
+  <script src="app.js"></script>
 </body>
 </html>
