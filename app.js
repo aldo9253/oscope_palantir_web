@@ -16,12 +16,15 @@ const state = {
   scales: {},           // per-ev:ch -> {tmin,tmax,ymin,ymax}
   fitResolution: 2000,
   datasetId: null,
+  fitAll: true,
 };
 
 // Compute worker wrapper to offload DSP/fits off the main thread
 const compute = (function(){
+  const WORKERS_OK = (typeof window!== 'undefined' && typeof Worker !== 'undefined' && (location.protocol === 'http:' || location.protocol === 'https:'));
   let w=null; let nextId=1; const pending=new Map();
   function ensure(){
+    if(!WORKERS_OK) return null;
     if(!w){
       try { w = new Worker('worker.js'); }
       catch (e) { console.warn('Worker init failed, using main-thread fallback', e); w=null; }
@@ -59,6 +62,95 @@ const compute = (function(){
     lowPassMax: (t, y, width, invert)=> call('low_pass_max', {t, y, width, invert}),
   };
 })();
+
+// Compute worker pool for parallel batch fits
+const computePool = (function(){
+  const WORKERS_OK = (typeof window!== 'undefined' && typeof Worker !== 'undefined' && (location.protocol === 'http:' || location.protocol === 'https:'));
+  const size = WORKERS_OK? Math.max(1, Math.min((navigator.hardwareConcurrency||2), 4)) : 0;
+  const workers=[]; const free=[]; const pending=new Map(); let nextId=1; const queue=[];
+  function makeWorker(i){
+    try{
+      const w = new Worker('worker.js');
+      w.onerror = ()=>{ /* mark this worker unusable */ };
+      w.onmessage = (ev)=>{
+        const {id, ok, result, error} = ev.data||{};
+        const cb = pending.get(id); if(cb){ pending.delete(id); if(ok) cb.resolve(result); else cb.reject(new Error(error||'Worker error')); }
+        free.push(i); schedule();
+      };
+      workers[i]=w; free.push(i);
+    }catch(e){ console.warn('Worker pool init failed; using single worker fallback', e); }
+  }
+  for(let i=0;i<size;i++) makeWorker(i);
+  function schedule(){
+    while(free.length && queue.length){
+      const wi = free.pop(); const job = queue.shift();
+      pending.set(job.id, {resolve: job.resolve, reject: job.reject});
+      try {
+        const transfer = job.transfer && Array.isArray(job.transfer) ? job.transfer : [];
+        workers[wi].postMessage({id: job.id, type: job.type, ...job.payload}, transfer);
+      }
+      catch(e){ pending.delete(job.id); free.push(wi); job.reject(e); }
+    }
+  }
+  function call(type, payload, transfer){
+    // If pool unavailable, fallback to single compute
+    if(workers.length===0){
+      if(type==='fit') return compute.fit(payload.fitName, payload.t, payload.y, payload.p0);
+      if(type==='sg') return compute.sg(payload.y, payload.window, payload.poly||2);
+      if(type==='low_pass_max') return compute.lowPassMax(payload.t, payload.y, payload.width, payload.invert);
+      if(type==='parse_trc') return Promise.reject(new Error('workers unavailable'));
+    }
+    return new Promise((resolve, reject)=>{ const id=nextId++; queue.push({id, type, payload, transfer, resolve, reject}); schedule(); });
+  }
+  return {
+    fit: (fitName, t, y, p0)=> call('fit', {fitName, t, y, p0}),
+    lowPassMax: (t, y, width, invert)=> call('low_pass_max', {t, y, width, invert}),
+    parseTrc: (buf)=> call('parse_trc', {buf}, [buf]),
+  };
+})();
+
+async function computePoolParseTrc(buf){
+  try{
+    if(computePool && computePool.parseTrc){
+      const res = await computePool.parseTrc(buf);
+      return res;
+    }
+    const res = await computePoolCallParseTrc(buf);
+    return res;
+  } catch(e){
+    // fallback through single worker if available
+    try{
+      const w = await computeParseTrcSingle(buf);
+      return w;
+    } catch(err){ throw err; }
+  }
+}
+
+function computePoolCallParseTrc(buf){
+  return new Promise((resolve, reject)=>{
+    // Create a minimal dedicated worker if pool has no parse support.
+    try{
+      if(!(typeof window!== 'undefined' && typeof Worker !== 'undefined' && (location.protocol === 'http:' || location.protocol === 'https:'))){
+        throw new Error('workers unavailable');
+      }
+      const w = new Worker('worker.js');
+      w.onerror = ()=>{ try{ w.terminate(); }catch(_){}; reject(new Error('Worker error')); };
+      const id = Math.floor(Math.random()*1e9) + 1;
+      w.onmessage = (ev)=>{
+        const {id:rid, ok, result, error} = ev.data||{}; if(rid!==id) return;
+        if(ok) resolve(result); else reject(new Error(error||'Worker error'));
+        w.terminate();
+      };
+      w.postMessage({id, type:'parse_trc', buf}, [buf]);
+    }catch(e){ reject(e); }
+  });
+}
+
+async function computeParseTrcSingle(buf){
+  // Reuse main-thread parser as ultimate fallback
+  const out = TrcReader.parseBuffer(buf);
+  return {t: out.t, y: out.y};
+}
 
 // Utilities
 function byId(id){ return document.getElementById(id); }
@@ -114,8 +206,7 @@ class TrcReader {
     // default to little
     return true;
   }
-  static async parseFile(file){
-    const buf = await file.arrayBuffer();
+  static parseBuffer(buf){
     const base = this.findWavedescOffset(buf);
     if(base<0) throw new Error('WAVEDESC not found');
     const view = new DataView(buf);
@@ -150,8 +241,12 @@ class TrcReader {
     else{ for(let i=0;i<n;i++){ yraw[i]=view.getInt8(dataOff + i); } }
     // scale
     const y = yraw.map(v=> VERTICAL_GAIN * v - VERTICAL_OFFSET);
-    const t = new Array(n); for(let i=0;i<n;i++){ t[i] = (i+1)*HORIZ_INTERVAL + HORIZ_OFFSET; }
+    const t = new Array(n); for(let i=0;i<n;i++){ t[i] = (i)*HORIZ_INTERVAL + HORIZ_OFFSET; }
     return {t,y,d:{ TEMPLATE_NAME: template }};
+  }
+  static async parseFile(file){
+    const buf = await file.arrayBuffer();
+    return this.parseBuffer(buf);
   }
 }
 
@@ -172,18 +267,19 @@ function createOrGetCanvas(container, ch){
   if(!wrap){
     wrap = document.createElement('div'); wrap.className='plot-item'; wrap.id=`${id}-wrap`;
     const header = document.createElement('div'); header.className='plot-header'; header.innerHTML = `<strong>Channel ${ch}</strong>`;
-    const canvas = document.createElement('canvas'); canvas.className='plot-canvas'; canvas.id=id; const cw = Math.max(800, container.clientWidth-40 || 1200); canvas.width = cw; canvas.height=250;
+    const canvas = document.createElement('canvas'); canvas.className='plot-canvas'; canvas.id=id;
     wrap.appendChild(header); wrap.appendChild(canvas); container.appendChild(wrap);
 
     // Selection handlers
-    let isDown=false; let x0=null; let x1=null; const pad=40;
+    let isDown=false; let x0=null; let x1=null;
     const onDown = (e)=>{ isDown=true; const rect=canvas.getBoundingClientRect(); x0 = e.clientX - rect.left; };
     const onMove = (e)=>{ if(!isDown) return; const rect=canvas.getBoundingClientRect(); x1 = e.clientX - rect.left; };
     const onUp   = (e)=>{
       if(!isDown) return; isDown=false; const rect=canvas.getBoundingClientRect(); x1 = e.clientX - rect.left;
       if(x0==null || x1==null) return; const ev = state.currentEvent; if(!ev) return;
-      const scale = state.scales[`${ev}:ch${ch}`]; if(!scale) return; const {tmin,tmax}=scale; const w=canvas.width;
-      const toT = (xp)=> tmin + clamp((xp - pad)/(w-2*pad),0,1) * (tmax - tmin);
+      const scale = state.scales[`${ev}:ch${ch}`]; if(!scale) return; const {tmin,tmax,padL,padR,width}=scale; const w = width || canvas.getBoundingClientRect().width;
+      const padLocalL = padL ?? 50; const padLocalR = padR ?? 12;
+      const toT = (xp)=> tmin + clamp((xp - padLocalL)/(w - padLocalL - padLocalR),0,1) * (tmax - tmin);
       const ta = toT(Math.min(x0,x1)); const tb = toT(Math.max(x0,x1));
       if(Math.abs(tb-ta) <= 0){ return; }
       state.fitRegion[`${ev}:ch${ch}`] = [ta,tb];
@@ -196,6 +292,20 @@ function createOrGetCanvas(container, ch){
   return document.getElementById(id);
 }
 
+function setCanvasSize(canvas, widthPx, heightPx){
+  const dpr = window.devicePixelRatio || 1;
+  // guard minimums
+  widthPx = Math.max(200, Math.floor(widthPx));
+  heightPx = Math.max(80, Math.floor(heightPx));
+  canvas.style.width = widthPx + 'px';
+  canvas.style.height = heightPx + 'px';
+  canvas.width = Math.round(widthPx * dpr);
+  canvas.height = Math.round(heightPx * dpr);
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return ctx;
+}
+
 function getPlotColors(){
   const dark = state.theme !== 'light';
   return {
@@ -204,7 +314,34 @@ function getPlotColors(){
     base: dark? '#ffffff' : '#000000',
     fit: '#ff3030',
     sg: dark? '#5fd35f' : '#2ca02c',
+    grid: dark? '#222' : '#ddd',
+    text: dark? '#bbb' : '#333',
   };
+}
+
+function getPlotPadding(){
+  return { padL: 55, padR: 12, padT: 10, padB: 28 };
+}
+
+function niceTicks(min, max, maxTicks=6){
+  const span = Math.max(1e-20, max - min);
+  const rough = span / Math.max(1, maxTicks);
+  const pow10 = Math.pow(10, Math.floor(Math.log10(rough)));
+  const candidates = [1, 2, 5, 10].map(m => m*pow10);
+  let step = candidates[0];
+  for(const c of candidates){ if(Math.abs(c - rough) < Math.abs(step - rough)) step=c; }
+  const niceMin = Math.ceil(min/step)*step;
+  const niceMax = Math.floor(max/step)*step;
+  const ticks=[]; for(let v=niceMin; v<=niceMax + 0.5*step; v+=step) ticks.push(v);
+  return {ticks, step};
+}
+
+function fmtTick(v){
+  const av = Math.abs(v);
+  if((av>0 && av<1e-3) || av>=1e4) return v.toExponential(1);
+  // show a few decimals proportionate to magnitude
+  const d = av>=1? 2: 4;
+  return v.toFixed(d).replace(/\.0+$/,'').replace(/\.$/,'');
 }
 
 function plotWaveforms(){
@@ -214,9 +351,38 @@ function plotWaveforms(){
   container.innerHTML='';
   const channels = Object.keys(obj.channels).map(Number).sort((a,b)=>a-b);
   state.scales = state.scales || {};
+  // compute responsive sizes
+  const mainEl = document.querySelector('main');
+  const viewportH = window.innerHeight || document.documentElement.clientHeight || 800;
+  // Prefer main content height (below header) to ensure plots stay under toolbar
+  const availH = Math.max(140, (mainEl? mainEl.clientHeight : (viewportH - (document.querySelector('header')?.offsetHeight||120))) - 8);
+  const containerW = container.clientWidth || (document.querySelector('main')?.clientWidth || 1000);
+  // Measure per-plot overhead (header + paddings/borders + header margin) and container gap
+  let overhead = 30; // fallback
+  let gapY = 4;
+  try{
+    const testCh = channels[0];
+    const testCv = createOrGetCanvas(container, testCh);
+    const wrap = testCv.parentElement;
+    const headerEl = wrap.querySelector('.plot-header');
+    const sw = getComputedStyle(wrap);
+    const sh = headerEl? getComputedStyle(headerEl): null;
+    const pb = parseFloat(sw.paddingTop||'0') + parseFloat(sw.paddingBottom||'0');
+    const bb = parseFloat(sw.borderTopWidth||'0') + parseFloat(sw.borderBottomWidth||'0');
+    const hm = sh? parseFloat(sh.marginBottom||'0'): 0;
+    const hh = headerEl? headerEl.offsetHeight: 18;
+    overhead = Math.max(16, hh + pb + bb + hm);
+    const sc = getComputedStyle(container);
+    gapY = parseFloat(sc.rowGap || sc.gap || '4') || 4;
+  } catch(_){}
+  let perCanvasH = state.fitAll? Math.max(60, Math.floor((availH - (channels.length-1)*gapY - channels.length*overhead)/Math.max(1, channels.length))) : 250;
+  if(state.fitAll){ perCanvasH = Math.max(60, Math.floor(perCanvasH * 0.95)); }
   for(const ch of channels){
     const cv = createOrGetCanvas(container, ch);
-    const g = cv.getContext('2d'); const w=cv.width, h=cv.height; const pad=40;
+    const g = setCanvasSize(cv, containerW - 24, perCanvasH);
+    const rect = cv.getBoundingClientRect();
+    const w = Math.floor(rect.width), h = Math.floor(rect.height);
+    const {padL, padR, padT, padB} = getPlotPadding();
     // theme-aware background and colors
     const colors = getPlotColors();
     g.clearRect(0,0,w,h); g.fillStyle=colors.bg; g.fillRect(0,0,w,h);
@@ -240,11 +406,27 @@ function plotWaveforms(){
       for(let i=0;i<yf.length;i++){ const v=yf[i]; if(Number.isFinite(v)){ if(v<ymin) ymin=v; if(v>ymax) ymax=v; } }
     }
     if(ymax===ymin){ ymax+=1; ymin-=1; }
-    state.scales[`${ev}:ch${ch}`] = {tmin,tmax,ymin,ymax};
-    const tx=(tt)=> pad + (tt - tmin)/(tmax-tmin)*(w-2*pad);
-    const ty=(vv)=> h-pad - (vv - ymin)/(ymax-ymin)*(h-2*pad);
-    // axes
-    g.strokeStyle=colors.axes; g.lineWidth=1; g.beginPath(); g.moveTo(pad,pad); g.lineTo(pad,h-pad); g.lineTo(w-pad,h-pad); g.stroke();
+    state.scales[`${ev}:ch${ch}`] = {tmin,tmax,ymin,ymax, padL, padR, padT, padB, width: w, height: h};
+    const tx=(tt)=> padL + (tt - tmin)/(tmax-tmin)*(w - padL - padR);
+    const ty=(vv)=> (h - padB) - (vv - ymin)/(ymax-ymin)*(h - padT - padB);
+    // grid and axes
+    const xTicks = niceTicks(tmin, tmax, 6).ticks;
+    const yTicks = niceTicks(ymin, ymax, 5).ticks;
+    // grid
+    g.strokeStyle=colors.grid; g.lineWidth=1; g.setLineDash([2,4]); g.beginPath();
+    for(const xt of xTicks){ const X = tx(xt); g.moveTo(X, padT); g.lineTo(X, h - padB); }
+    for(const yt of yTicks){ const Y = ty(yt); g.moveTo(padL, Y); g.lineTo(w - padR, Y); }
+    g.stroke(); g.setLineDash([]);
+    // axes outline
+    g.strokeStyle=colors.axes; g.lineWidth=1; g.beginPath(); g.moveTo(padL,padT); g.lineTo(padL,h-padB); g.lineTo(w-padR,h-padB); g.stroke();
+    // tick labels
+    g.fillStyle=colors.text; g.font='12px sans-serif'; g.textAlign='center'; g.textBaseline='top';
+    for(const xt of xTicks){ const X=tx(xt); g.fillText(fmtTick(xt), X, h - padB + 2); }
+    g.textAlign='right'; g.textBaseline='middle';
+    for(const yt of yTicks){ const Y=ty(yt); g.fillText(fmtTick(yt), padL - 6, Y); }
+    // axis labels (simple)
+    g.textAlign='center'; g.textBaseline='bottom'; g.fillText('t (s)', (padL + (w - padR))/2, h - 4);
+    g.save(); g.translate(12, padT + (h - padT - padB)/2); g.rotate(-Math.PI/2); g.textAlign='center'; g.textBaseline='top'; g.fillText('y', 0, 0); g.restore();
     // waveform
     const dec = Math.max(1, state.decim|0);
     g.strokeStyle = colors.base; g.lineWidth=1.2; g.beginPath(); for(let i=0;i<t.length;i+=dec){ const X=tx(t[i]); const Y=ty(y[i]); if(i===0) g.moveTo(X,Y); else g.lineTo(X,Y);} g.stroke();
@@ -252,7 +434,7 @@ function plotWaveforms(){
     const sgKey = `${ev}:ch${ch}`; const sgv = state.sgFiltered[sgKey]; if(sgv){ const {t:tt,y:yy}=sgv; g.strokeStyle=colors.sg; g.beginPath(); for(let i=0;i<tt.length;i+=dec){const X=tx(tt[i]); const Y=ty(yy[i]); if(i===0) g.moveTo(X,Y); else g.lineTo(X,Y);} g.stroke(); }
     // Region overlay
     const reg = state.fitRegion[`${ev}:ch${ch}`];
-    if(reg && reg.length===2){ g.strokeStyle='#ff5050'; g.setLineDash([5,4]); g.beginPath(); g.moveTo(tx(reg[0]), pad); g.lineTo(tx(reg[0]), h-pad); g.moveTo(tx(reg[1]), pad); g.lineTo(tx(reg[1]), h-pad); g.stroke(); g.setLineDash([]); }
+    if(reg && reg.length===2){ g.strokeStyle='#ff5050'; g.setLineDash([5,4]); g.beginPath(); g.moveTo(tx(reg[0]), padT); g.lineTo(tx(reg[0]), h - padB); g.moveTo(tx(reg[1]), padT); g.lineTo(tx(reg[1]), h - padB); g.stroke(); g.setLineDash([]); }
     // Fit overlays/markers for this event+channel
     for(const [k,rec] of Object.entries(state.results)){
       const m = k.match(new RegExp(`^evt_${ev}_(.+)_ch${ch}(?:_\\d+)?$`));
@@ -709,8 +891,17 @@ async function loadEvent(ev){
   for(const ch of Object.keys(channels)){
     const file = channels[ch]; let t=[], y=[];
     if(/\.(trc)$/i.test(file.name)){
-      try{ const out = await TrcReader.parseFile(file); t=out.t; y=out.y; }
-      catch(err){ console.warn('TRC parse failed', file.name, err); continue; }
+      try{
+        const buf = await file.arrayBuffer();
+        // Try worker pool for parsing
+        try{
+          const out = await computePoolParseTrc(buf);
+          t = out.t; y = out.y;
+        } catch (e){
+          // Fallback to main-thread parser
+          const out = TrcReader.parseBuffer(buf); t=out.t; y=out.y;
+        }
+      } catch(err){ console.warn('TRC parse failed', file.name, err); continue; }
     } else {
       const out = await parseCSV(file); t=out.t; y=out.y;
     }
@@ -751,6 +942,7 @@ byId('next-btn').addEventListener('click', async ()=>{ const arr=(state.featureF
 // Decimation
 byId('decim').addEventListener('input', (e)=>{ state.decim=clamp(parseInt(e.target.value,10)||1,1,100); plotWaveforms(); });
 byId('fit-res').addEventListener('input', (e)=>{ const v=parseInt(e.target.value,10); if(Number.isFinite(v)) state.fitResolution = clamp(v, 200, 10000); });
+byId('fit-vert').addEventListener('change', (e)=>{ state.fitAll = !!e.target.checked; plotWaveforms(); });
 
 // Fit select
 const fitSel = byId('fit-select'); Object.keys(FIT_LIB).forEach(k=>{ const o=document.createElement('option'); o.value=k; o.textContent=k; fitSel.appendChild(o); });
@@ -865,40 +1057,57 @@ byId('batch-fit-btn').addEventListener('click', async ()=>{
   const evKeys = state.featureFilter? state.featureFilter: state.eventOrder;
   if(evKeys.length===0) return;
   // prompt simple range and window
-  const start = prompt('Start event (key)', evKeys[0]); if(!start) return;
-  const end = prompt('End event (key)', evKeys[evKeys.length-1]); if(!end) return;
-  const t0s = prompt('Time start (s)', ''); const t1s = prompt('Time end (s)', '');
-  const t0 = parseFloat(t0s), t1=parseFloat(t1s); const added=[];
-  const keys = evKeys.slice(evKeys.indexOf(start), evKeys.indexOf(end)+1);
-  showBusy('Batch fitting…');
-  for(const ev of keys){ const data = await getEventChannelData(ev, ch); if(!data) continue; let {t,y}=data; let t0w=t0, t1w=t1; // prefer per-channel saved region
-    const reg = state.fitRegion[`${ev}:ch${ch}`]; if(reg && reg.length===2){ t0w = reg[0]; t1w = reg[1]; }
-    if(isFinite(t0w) && isFinite(t1w)){ const mask=t.map((tt,i)=> tt>=t0w && tt<=t1w? i: -1).filter(i=>i>=0); if(mask.length>5){ t=mask.map(i=>t[i]); y=mask.map(i=>y[i]); } }
-    const ss=subsample(t,y,state.fitResolution||2000);
-    try{
-      const base=`evt_${ev}_${fname}_ch${ch}`; let i=1; let k=base; while(state.results[k]){ i++; k=`${base}_${i}`; }
-      if(fname==='low_pass_max'){
-        const width = (guessParams(fname, (model && model.names)||['width'], t, y)[0])|0;
-        const res = await compute.lowPassMax(ss.t, ss.y, width, invert);
-        state.results[k]={ params:[res.width], param_names:['width'], fit_region:[t[0],t[t.length-1]], inverted: invert, value: res.value, t_at: res.t_at, dataset_id: state.datasetId };
-      } else {
-        const yy = invert? ss.y.map(v=>-v): ss.y;
-        const p0=guessParams(fname, model.names, ss.t, yy);
-        const fres = await compute.fit(fname, ss.t, yy, p0);
-        const popt = fres && fres.params ? fres.params : lsqFit(model, ss.t, yy, p0);
-        const rec = {params:popt,param_names:model.names,fit_region:[t[0],t[t.length-1]],inverted:invert, dataset_id: state.datasetId};
-        attachDerivedMetrics(fname, rec);
-        state.results[k]=rec;
-      }
-      added.push(k);
-    }catch(e){/*skip*/}
-    // free memory for non-current events
-    if(ev!==state.currentEvent){ delete state.events[ev]; }
-    updateBusy(`Batch fitting… ${added.length}/${keys.length}`);
+  const start = prompt('Start event (key or number)', evKeys[0]); if(!start && start!=="0") return;
+  const end = prompt('End event (key or number)', evKeys[evKeys.length-1]); if(!end && end!=="0") return;
+  // If there is a selection on the current event/channel, use that as the batch window
+  const curReg = state.fitRegion[`${state.currentEvent}:ch${ch}`];
+  let useCurrentRegion=false; let t0=undefined, t1=undefined;
+  if(curReg && curReg.length===2 && isFinite(curReg[0]) && isFinite(curReg[1])){
+    useCurrentRegion = true; t0=curReg[0]; t1=curReg[1];
+  } else {
+    const t0s = prompt('Time start (s)', ''); const t1s = prompt('Time end (s)', '');
+    t0 = parseFloat(t0s); t1 = parseFloat(t1s);
   }
+  // Normalize range selection by numeric value to be robust to leading zeros
+  const sN = parseInt(start, 10); const eN = parseInt(end, 10);
+  const lo = Math.min(sN, eN), hi = Math.max(sN, eN);
+  const keys = evKeys.filter(k => { const n=parseInt(k,10); return n>=lo && n<=hi; });
+  const added=[]; let completed=0;
+  showBusy('Batch fitting…');
+  const tasks=[];
+  for(const ev of keys){
+    tasks.push((async ()=>{
+      const data = await getEventChannelData(ev, ch); if(!data) { completed++; updateBusy(`Batch fitting… ${completed}/${keys.length}`); return; }
+      let {t,y}=data; let t0w=t0, t1w=t1;
+      if(!useCurrentRegion){ const reg = state.fitRegion[`${ev}:ch${ch}`]; if(reg && reg.length===2){ t0w = reg[0]; t1w = reg[1]; } }
+      if(isFinite(t0w) && isFinite(t1w)){ const mask=t.map((tt,i)=> tt>=t0w && tt<=t1w? i: -1).filter(i=>i>=0); if(mask.length>5){ t=mask.map(i=>t[i]); y=mask.map(i=>y[i]); } }
+      const ss=subsample(t,y,state.fitResolution||2000);
+      try{
+        const base=`evt_${ev}_${fname}_ch${ch}`; let i=1; let k=base; while(state.results[k]){ i++; k=`${base}_${i}`; }
+        if(fname==='low_pass_max'){
+          const width = (guessParams(fname, (model && model.names)||['width'], t, y)[0])|0;
+          const res = await computePool.lowPassMax(ss.t, ss.y, width, invert);
+          state.results[k]={ params:[res.width], param_names:['width'], fit_region:[t[0],t[t.length-1]], inverted: invert, value: res.value, t_at: res.t_at, dataset_id: state.datasetId };
+        } else {
+          const yy = invert? ss.y.map(v=>-v): ss.y;
+          const p0=guessParams(fname, model.names, ss.t, yy);
+          const fres = await computePool.fit(fname, ss.t, yy, p0);
+          const popt = fres && fres.params ? fres.params : lsqFit(model, ss.t, yy, p0);
+          const rec = {params:popt,param_names:model.names,fit_region:[t[0],t[t.length-1]],inverted:invert, dataset_id: state.datasetId};
+          attachDerivedMetrics(fname, rec);
+          state.results[k]=rec;
+        }
+        added.push(k);
+      }catch(e){ /* skip this event */ }
+      finally {
+        completed++; updateBusy(`Batch fitting… ${completed}/${keys.length}`);
+        if(ev!==state.currentEvent){ delete state.events[ev]; }
+      }
+    })());
+  }
+  await Promise.all(tasks);
   alert(`Batch complete. Added ${added.length} fits.`);
-  plotWaveforms();
-  hideBusy();
+  plotWaveforms(); hideBusy();
 });
 
 // Feature scan
@@ -1193,6 +1402,9 @@ document.addEventListener('keydown', (e)=>{
   else if(k===',' ){ byId('prev-btn').click(); e.preventDefault(); }
   else if(k==='.') { byId('next-btn').click(); e.preventDefault(); }
 });
+
+// Re-layout on resize
+window.addEventListener('resize', ()=>{ plotWaveforms(); });
 
 // Clear all fits for current event/channel
 byId('clear-chan-btn').addEventListener('click', ()=>{

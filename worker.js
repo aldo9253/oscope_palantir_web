@@ -78,6 +78,7 @@ self.onmessage = (e)=>{
       case 'fit':        result = handleFit(e.data); break;
       case 'sg':         result = handleSG(e.data); break;
       case 'low_pass_max': result = handleLowPassMax(e.data); break;
+      case 'parse_trc':  result = handleParseTrc(e.data); break;
       default: throw new Error('Unknown task type: '+type);
     }
     self.postMessage({id, ok:true, result});
@@ -86,3 +87,59 @@ self.onmessage = (e)=>{
   }
 };
 
+// TRC parsing in worker
+function findWavedescOffset(buf){
+  const bytes = new Uint8Array(buf, 0, Math.min(8192, buf.byteLength));
+  const pat = new TextEncoder().encode('WAVEDESC');
+  for(let i=0;i<=bytes.length-pat.length;i++){
+    let ok=true; for(let j=0;j<pat.length;j++){ if(bytes[i+j]!==pat[j]){ ok=false; break; } }
+    if(ok) return i;
+  }
+  return -1;
+}
+function detectEndian(view, base){
+  const be = view.getUint16(base+34, false);
+  const le = view.getUint16(base+34, true);
+  if(le===1 || be===256) return true;
+  if(le===0 || be===0) return false;
+  return true;
+}
+function handleParseTrc(msg){
+  const {buf} = msg; if(!buf) throw new Error('No buffer');
+  const base = findWavedescOffset(buf); if(base<0) throw new Error('WAVEDESC not found');
+  const view = new DataView(buf);
+  const little = detectEndian(view, base);
+  const getI16 = (off)=> view.getInt16(base+off, little);
+  const getU16 = (off)=> view.getUint16(base+off, little);
+  const getI32 = (off)=> view.getInt32(base+off, little);
+  const getF32 = (off)=> view.getFloat32(base+off, little);
+  const getF64 = (off)=> view.getFloat64(base+off, little);
+  // Types and lengths
+  const commTypeLE = view.getUint16(base+32, true);
+  const commTypeBE = view.getUint16(base+32, false);
+  const is16 = (commTypeLE===1 || commTypeBE===256 || (commTypeLE!==0 && commTypeBE!==0));
+  const lWAVEDESC = getI32(36);
+  const lUSERTEXT = getI32(40);
+  const lTRIGTIME = getI32(48);
+  const lRISTIME  = getI32(52);
+  const lWAVE1    = getI32(60);
+  // Scales
+  const VERTICAL_GAIN   = getF32(156);
+  const VERTICAL_OFFSET = getF32(160);
+  const HORIZ_INTERVAL  = getF32(176);
+  const HORIZ_OFFSET    = getF64(180);
+  // Data start and count
+  const dataOff = base + lWAVEDESC + lUSERTEXT + lTRIGTIME + lRISTIME;
+  const bytesPer = is16? 2: 1;
+  const nFromLen = lWAVE1>0? Math.floor(lWAVE1/bytesPer): 0;
+  const maxN = Math.max(0, Math.floor((buf.byteLength - dataOff)/bytesPer));
+  const n = Math.max(0, Math.min(nFromLen || maxN, maxN));
+  if(n<=0) throw new Error('No waveform samples');
+  // Read samples
+  const yraw = new Int32Array(n);
+  if(is16){ for(let i=0;i<n;i++){ yraw[i]=view.getInt16(dataOff + 2*i, little); } }
+  else { for(let i=0;i<n;i++){ yraw[i]=view.getInt8(dataOff + i); } }
+  const y = new Float64Array(n); for(let i=0;i<n;i++){ y[i] = VERTICAL_GAIN * yraw[i] - VERTICAL_OFFSET; }
+  const t = new Float64Array(n); for(let i=0;i<n;i++){ t[i] = (i)*HORIZ_INTERVAL + HORIZ_OFFSET; }
+  return { t: Array.from(t), y: Array.from(y), meta: { endian: little? 'LE':'BE', comm_type: is16? 'int16':'int8' } };
+}
