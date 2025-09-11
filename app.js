@@ -224,7 +224,7 @@ function plotWaveforms(){
     let tmin=t[0], tmax=t[t.length-1]; let ymin=Infinity, ymax=-Infinity; for(const v of y){ if(v<ymin) ymin=v; if(v>ymax) ymax=v; }
     // include fit overlays/markers in y-range so they are visible
     for(const [k,rec] of Object.entries(state.results)){
-      const m = k.match(new RegExp(`^evt_${ev}_([^_]+)_ch${ch}(?:_\\d+)?$`));
+      const m = k.match(new RegExp(`^evt_${ev}_(.+)_ch${ch}(?:_\\d+)?$`));
       if(!m) continue; const fitName=m[1]; const model=FIT_LIB[fitName];
       const region = rec.fit_region || [t[0], t[t.length-1]]; const t0r=Math.max(region[0], t[0]); const t1r=Math.min(region[1], t[t.length-1]);
       if(!(t1r>t0r)) continue;
@@ -255,7 +255,7 @@ function plotWaveforms(){
     if(reg && reg.length===2){ g.strokeStyle='#ff5050'; g.setLineDash([5,4]); g.beginPath(); g.moveTo(tx(reg[0]), pad); g.lineTo(tx(reg[0]), h-pad); g.moveTo(tx(reg[1]), pad); g.lineTo(tx(reg[1]), h-pad); g.stroke(); g.setLineDash([]); }
     // Fit overlays/markers for this event+channel
     for(const [k,rec] of Object.entries(state.results)){
-      const m = k.match(new RegExp(`^evt_${ev}_([^_]+)_ch${ch}(?:_\\d+)?$`));
+      const m = k.match(new RegExp(`^evt_${ev}_(.+)_ch${ch}(?:_\\d+)?$`));
       if(!m) continue; const fitName = m[1]; const model = FIT_LIB[fitName]; const invert=!!rec.inverted;
       const region = rec.fit_region || [t[0], t[t.length-1]];
       if(fitName==='low_pass_max'){
@@ -954,6 +954,7 @@ async function ensureH5Wasm(){
   if(window.h5wasmReady) return true;
   // Prefer ESM build if available
   const esmPaths = [
+    './hdf5_hl.js', // user-provided copy alongside index.html
     './vendor/h5wasm/dist/esm/hdf5_hl.js',
     'vendor/h5wasm/dist/esm/hdf5_hl.js'
   ];
@@ -1070,7 +1071,7 @@ async function importHDF5File(file){
 
 function buildResultsRows(){
   const rows=[];
-  const re = /^evt_(\w+)_([^_]+)_ch(\d+)(?:_\d+)?$/;
+  const re = /^evt_(\w+)_(.+)_ch(\d+)(?:_\d+)?$/;
   for(const [k,rec] of Object.entries(state.results)){
     const m = k.match(re); if(!m) continue;
     const [_, event, fit, ch] = m;
@@ -1131,7 +1132,7 @@ byId('show-info-btn').addEventListener('click', ()=>{
   const onlyDs = byId('fit-info-only-ds').checked;
   const curDs = state.datasetId;
   for(const [k,rec] of Object.entries(state.results)){
-    const m = k.match(/^evt_(\w+)_([^_]+)_ch(\d+)/);
+    const m = k.match(/^evt_(\w+)_(.+)_ch(\d+)/);
     if(!m) continue; const event=m[1], fit=m[2], ch=m[3];
     if(onlyDs && curDs && rec.dataset_id && rec.dataset_id !== curDs) continue;
     const params = rec.params.map(v=>Number(v).toExponential(3)).join(', ');
