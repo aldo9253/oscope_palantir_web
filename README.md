@@ -1,70 +1,44 @@
-Oscilloscope Palantir (Web)
-===========================
+Oscilloscope Viewer (Web)
+=========================
 
-This is a browser-based reimplementation (in progress) of `oscope_palantir.py`.
-It aims to provide a similar UI and workflow using HTML/JavaScript.
+Browser-based waveform viewer for local oscilloscope data (`.trc`, `.csv`, `.txt`).
 
-Status
-------
-- Loads local waveform files (CSV) via the browser (no server required).
-- Loads LeCroy `.trc` files directly in the browser (experimental) — no CSV expansion required.
-- Groups files into events by filename and channel.
-- Plots selected event channels on an interactive canvas.
-- Savitzky–Golay filtering (SG) for smoothing.
-- Dynamic fits: QD3Fit, QDMFit, CSA_pulse, skew_gaussian, gaussian.
-- Batch Run across an event range for the selected fit/time window.
-- Feature Scan to flag events with |signal| > threshold × std.
-- Results are kept in-memory and can be exported as JSON; CSV fallback export is available.
-- Import Results (JSON) merges saved fits back into the session (dataset-aware).
-- low_pass_max measurement (SG+peak) with invert handling.
-- Derived metrics for QD3/QDM (charge/mass/radius) shown in Fit Info.
+What It Does
+------------
+- Loads local waveform files directly in the browser.
+- Parses LeCroy `.trc` files in-browser (worker + fallback parser).
+- Groups files by event using filename patterns like `C1-00012.trc`.
+- Displays event waveforms per channel with pan/zoom and decimation.
+- Supports SG-filter overlay for quick smoothing checks.
+- Lets you show/hide channels with a channel visibility menu:
+  - `Show All`
+  - `Hide All`
+  - Per-channel toggles
 
-Limitations (for now)
----------------------
-- `.trc` support is based on the LeCroy LECROY_2_3 WAVEDESC template used by
-  `readTrcDoner.py`. Other templates may not parse correctly yet.
-- CSV input is still supported as an alternative for testing.
+Notes
+-----
+- This web app is now viewing-focused.
+- Fit routines, fit/batch-fit tools, and fit result export/import workflows were removed.
 
 Usage
 -----
-1) Open `index.html` in a modern browser (Chrome/Edge/Firefox).
-2) Click “Select Folder” and choose your CSV folder (hold Shift/Ctrl to select multiple
-   files, or choose a directory if your browser supports `webkitdirectory`).
-3) Choose an event from the dropdown to plot.
-4) Use SG filter, run dynamic fits, batch run, and feature scan similarly to the desktop app.
+1. Open `index.html` in a modern browser.
+2. Click `Select Folder` and choose your data folder.
+3. Pick an event from the dropdown.
+4. Use:
+   - `Tool: Zoom` to drag a zoom box
+   - `Tool: Pan` to drag view (hold `Shift` for vertical pan)
+   - mouse wheel to zoom (`Shift`/`Ctrl` for Y zoom)
+   - double-click a plot to reset that channel view
+5. Use `Channels` menu to hide/show channel plots.
+6. Optional: run `SG Filter` on a selected channel.
 
-File naming convention
-----------------------
-Files should be named like `C<channel>-<event>.<ext>` (e.g., `C1-00012.trc`,
-`C2-00012.csv`). The app groups files with the same `<event>` number into one
-event, per channel. A more flexible pattern `C<ch>...-<event>.trc` is also
-recognized for `.trc` files.
+File Naming
+-----------
+Supported grouping patterns:
+- `C<channel>-<event>.<ext>`
+- `C<channel>...-<event>.trc`
 
-Helper: TRC to CSV (optional)
-------------------------------
-Use `trc_to_csv.py` to convert `.trc` files into CSV pairs per event:
-
-    python trc_to_csv.py /path/to/trc_folder /path/to/output_csv
-
-This requires Python with `readTrcDoner.py` available in your PYTHONPATH.
-
-Exporting results
------------------
-Click “Export Results” to download a JSON of fit results. This mirrors the in-memory
-structure with keys like `evt_<id>_<fit>_ch<ch>`.
-
-Planned
--------
-- Direct `.trc` parsing in the browser (if feasible), or a lightweight local companion.
-- HDF5 export/import via h5wasm (scaffolded; see below to enable).
-- UI polish to fully match the desktop app.
-
-HDF5 (optional)
----------------
-To enable HDF5 import/export in the browser, place the h5wasm bundle under:
-
-    oscope_html/vendor/h5wasm/hdf5_hl.js
-
-and the associated WASM assets as required by that build. After reloading
-`index.html`, the Export/Import HDF5 buttons will attempt to use the HDF5 engine.
-If unavailable, the app offers a CSV fallback for export and a message for import.
+Examples:
+- `C1-00012.trc`
+- `C2-00012.csv`
